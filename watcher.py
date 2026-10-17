@@ -2,10 +2,12 @@
 
 Берёт официальную выгрузку BestChange (api.bestchange.ru/info.zip, обновляется ~раз в минуту),
 проверяет правила из config.json и шлёт в Telegram, когда курс >= порога.
+Раз в день присылает сводку: лучший курс, его место за 30 дней, наценка к курсу ЦБ, ближайшие события.
 
 Запуск:
   python watcher.py                  # бесконечный цикл с интервалом из конфига
   python watcher.py --once           # одна проверка (для Планировщика задач)
+  python watcher.py --summary        # показать сводку по текущим данным (без отправки)
   python watcher.py --find usdc      # найти точное название валюты
   python watcher.py --top "USDC BEP20 (USDC)" "Т-Банк RUB"   # топ обменников по паре
   python watcher.py --chat-id        # узнать свой chat_id (сначала напишите боту /start)
@@ -19,8 +21,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 import zipfile
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -32,6 +35,18 @@ MSK = timezone(timedelta(hours=3))
 FETCH_ATTEMPTS = 3       # разовый таймаут BestChange — не повод для тревоги
 FETCH_PAUSE_SEC = 10
 ERROR_REPEAT_SEC = 3600  # предупреждение о сбое — не чаще раза в час
+HISTORY_DAYS = 60        # сколько дней истории курсов хранить
+CBR_RETRY_SEC = 3600     # курс ЦБ не ответил — следующая попытка через час
+CBR_JSON = "https://www.cbr-xml-daily.ru/daily_json.js"
+CBR_XML = "https://www.cbr.ru/scripts/XML_daily.asp"
+# Заседания ЦБ по ключевой ставке. Обновлять раз в год (график выходит в сентябре);
+# переопределяется в конфиге: "summary": {"cbr_meetings": [...]}
+CBR_MEETINGS = [
+    "2026-10-23", "2026-12-18",
+    "2027-02-12", "2027-03-19", "2027-04-30", "2027-06-11",
+    "2027-07-30", "2027-09-10", "2027-10-22", "2027-12-17",
+]
+HOLIDAYS = {(1, d) for d in range(1, 9)} | {(2, 23), (3, 8), (5, 1), (5, 9), (6, 12), (11, 4)}
 
 
 def load_json(path, default):
@@ -117,11 +132,30 @@ def describe(e):
     return str(e) if isinstance(e, (RuntimeError, ValueError)) else f"{type(e).__name__}: {e}"
 
 
-def check(cfg, state):
-    """Проверяет все правила. Возвращает список проблем (пустой — всё в порядке)."""
+def summary_cfg(cfg):
+    """Настройки сводки с умолчаниями; None — сводка выключена ("summary": false)."""
+    sm = cfg.get("summary", {})
+    if sm is False:
+        return None
+    return {
+        "at": sm.get("at", "10:00"),
+        "from": sm.get("from", cfg["rules"][0]["from"] if cfg.get("rules") else None),
+        "cbr_meetings": sm.get("cbr_meetings", CBR_MEETINGS),
+    }
+
+
+def check(cfg, state, ctx):
+    """Проверяет все правила. Возвращает список проблем (пустой — всё в порядке).
+    В ctx складывает курсы для сводки: obs {(обменник, банк): курс}, missing, from_name."""
     zf = fetch_zip()
     cy, ex = currencies(zf), exchangers(zf)
     known = {n.lower() for n in ex.values()}
+    sm = summary_cfg(cfg)
+    try:
+        sum_fid = resolve_currency(cy, sm["from"]) if sm and sm["from"] is not None else None
+    except ValueError:
+        sum_fid = None  # битое имя всплывёт ниже как проблема правила
+    obs, missing_all = {}, set()
     problems = []
     for i, rule in enumerate(cfg["rules"], 1):
         try:
@@ -136,6 +170,8 @@ def check(cfg, state):
                 name = ex.get(eid, str(eid))
                 if wanted and name.lower() not in wanted:
                     continue
+                if fid == sum_fid:
+                    obs[(name, cy[tid][0].removesuffix(" RUB"))] = rate
                 key = f"{fid}-{tid}-{eid}-{rule['min_rate']}"
                 hit = rate >= rule["min_rate"]
                 if hit and not state.get(key):
@@ -150,10 +186,168 @@ def check(cfg, state):
             missing = wanted - unknown - {ex.get(e, "").lower() for e in rates}
             if missing:
                 print(f"[info] правило {i}, нет в паре сейчас: {', '.join(sorted(missing))}")
+            if fid == sum_fid:
+                names = {n.lower(): n for n in rule.get("exchangers", [])}
+                missing_all |= {names[m] for m in missing}
         except Exception as e:  # одно битое правило не должно глушить остальные
             problems.append(f"правило {i}: {describe(e)}")
+    if sum_fid is not None:
+        ctx.update(obs=obs, from_name=cy[sum_fid][1],
+                   missing=missing_all - {name for name, _ in obs})
     return problems
 
+
+# ---------- история курсов и сводка ----------
+
+def fetch_cbr_usd():
+    """Курс доллара ЦБ на сегодня. Два источника: зеркало и сам cbr.ru."""
+    errors = []
+    try:
+        with urllib.request.urlopen(CBR_JSON, timeout=20) as r:
+            return float(json.loads(r.read())["Valute"]["USD"]["Value"])
+    except Exception as e:
+        errors.append(f"cbr-xml-daily.ru: {describe(e)}")
+    try:
+        req = urllib.request.Request(CBR_XML, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            v = ET.fromstring(r.read()).find("Valute[@ID='R01235']")
+        return float(v.findtext("Value").replace(",", ".")) / float(v.findtext("Nominal"))
+    except Exception as e:
+        errors.append(f"cbr.ru: {describe(e)}")
+    raise RuntimeError("; ".join(errors))
+
+
+def record(state, day, obs, now):
+    """Дневные итоги [макс, мин, сумма, число замеров]: по паре, по обменнику (@) и лучший (_best)."""
+    hist = state.setdefault("_hist", {})
+    d = hist.setdefault(day, {"r": {}})
+
+    def add(k, v):
+        a = d["r"].get(k)
+        d["r"][k] = [v, v, round(v, 4), 1] if not a else \
+            [max(a[0], v), min(a[1], v), round(a[2] + v, 4), a[3] + 1]
+
+    per_ex = {}
+    for (name, bank), rate in obs.items():
+        add(f"{name}|{bank}", rate)
+        per_ex[name] = max(per_ex.get(name, 0), rate)
+    for name, rate in per_ex.items():
+        add("@" + name, rate)
+    if obs:
+        add("_best", max(obs.values()))
+    if "cbr" not in d and now - state.get("_cbr_try", 0) >= CBR_RETRY_SEC:
+        state["_cbr_try"] = now
+        try:
+            d["cbr"] = round(fetch_cbr_usd(), 4)
+            state.pop("_cbr_err", None)
+        except Exception as e:
+            state["_cbr_err"] = describe(e)[:300]
+            print("[warn] курс ЦБ:", state["_cbr_err"])
+    for old in sorted(hist)[:-HISTORY_DAYS]:
+        del hist[old]
+
+
+def day_avg(hist, day, key):
+    a = hist.get(day, {}).get("r", {}).get(key)
+    return a[2] / a[3] if a else None
+
+
+def usual_range(vals):
+    """«Обычный» разброс: без 10% самых низких и 10% самых высоких. Нужно ≥ 5 дней."""
+    if len(vals) < 5:
+        return None
+    v = sorted(vals)
+    k = len(v) // 10
+    v = v[k:len(v) - k]
+    return v[0], v[-1]
+
+
+def pct(x):
+    return f"{x:+.1f}%".replace(".", ",")
+
+
+def upcoming_events(today, meetings, horizon=7):
+    """События ближайших дней — не прогноз, а «в эти дни возможны движения»."""
+    ev = [(date.fromisoformat(s), "заседание ЦБ по ключевой ставке") for s in meetings]
+    for k in range(2):  # этот и следующий месяц
+        y, m = today.year + (today.month + k - 1) // 12, (today.month + k - 1) % 12 + 1
+        tax = date(y, m, 28)
+        while tax.weekday() >= 5:
+            tax += timedelta(days=1)
+        ev.append((tax, "уплата налогов: экспортёры продают валюту"))
+        d, n = date(y, m, 1), 0  # 3-й рабочий день; переносы праздников не учтены — отсюда «≈»
+        while True:
+            if d.weekday() < 5 and (d.month, d.day) not in HOLIDAYS:
+                n += 1
+                if n == 3:
+                    break
+            d += timedelta(days=1)
+        ev.append((d, "≈ Минфин объявляет покупку/продажу валюты"))
+    out = []
+    for d, what in sorted(ev):
+        days = (d - today).days
+        if 0 <= days <= horizon:
+            when = "сегодня" if days == 0 else "завтра" if days == 1 else f"через {days} дн."
+            out.append(f"⚠️ {d:%d.%m} ({when}) — {what}")
+    if not any(date.fromisoformat(s) >= today for s in meetings):
+        out.append("⚙️ Даты заседаний ЦБ закончились — обновите список в настройках")
+    return out
+
+
+def build_summary(state, ctx, today, meetings):
+    hist = state.get("_hist", {})
+    past = [d for d in sorted(hist) if d < today.isoformat()][-30:]
+    # курс ЦБ за сегодня; не получен — последний известный (за день он меняется мало)
+    cbr_day = next((d for d in sorted(hist, reverse=True)
+                    if d <= today.isoformat() and "cbr" in hist[d]), None)
+    cbr = hist[cbr_day]["cbr"] if cbr_day else None
+    cbr_label = "" if cbr_day == today.isoformat() else f" на {cbr_day[8:10]}.{cbr_day[5:7]}" if cbr_day else ""
+    obs = ctx["obs"]
+    lines = [f"📊 Сводка {today:%d.%m} · {ctx['from_name']}"]
+    if not obs:
+        lines.append("Сейчас ни одного вашего обменника в паре")
+    else:
+        (bname, bbank), best = max(obs.items(), key=lambda x: x[1])
+        lines.append(f"Лучший курс: {best:.2f} ({bname}, {bbank})")
+        vals = [v for v in (day_avg(hist, d, "_best") for d in past) if v is not None]
+        if len(vals) >= 3:
+            label = "За 30 дней" if len(vals) >= 30 else f"За {len(vals)} дн."
+            lines.append(f"{label}: выше, чем в {round(100 * sum(v < best for v in vals) / len(vals))}% дней")
+        else:
+            lines.append(f"Сравнение с прошлыми днями — после 3 дней истории (сейчас {len(vals)})")
+
+        def markups(key):
+            return [day_avg(hist, d, key) / hist[d]["cbr"] * 100 - 100
+                    for d in past if "cbr" in hist[d] and day_avg(hist, d, key) is not None]
+
+        def usual(key):
+            r = usual_range(markups(key))
+            return f" (обычно {pct(r[0]).rstrip('%')}…{pct(r[1])})" if r else ""
+
+        if cbr:
+            lines.append(f"К курсу ЦБ{cbr_label} ({cbr:.2f}): {pct(best / cbr * 100 - 100)}{usual('_best')}")
+        else:
+            lines.append(f"Курс ЦБ: нет данных ({state.get('_cbr_err', 'ещё не получен')})")
+        per_ex = {}
+        for (name, bank), rate in obs.items():
+            if rate > per_ex.get(name, (0, ""))[0]:
+                per_ex[name] = (rate, bank)
+        lines.append("")
+        for name, (rate, bank) in sorted(per_ex.items(), key=lambda x: -x[1][0])[:8]:
+            m = f" · {pct(rate / cbr * 100 - 100)}{usual('@' + name)}" if cbr else ""
+            lines.append(f"{name}: {rate:.2f} ({bank}){m}")
+    for name in sorted(ctx.get("missing", ())):
+        lines.append(f"{name}: нет в паре")
+    events = upcoming_events(today, meetings)
+    if events:
+        lines.append("")
+        lines.extend(events)
+    if len(past) < 30:
+        lines.append(f"\nИстория курсов: {len(past)} из 30 дней")
+    return "\n".join(lines)
+
+
+# ---------- запуск ----------
 
 def fmt_msk(ts):
     return datetime.fromtimestamp(ts, MSK).strftime("%d.%m %H:%M")
@@ -182,23 +376,53 @@ def report_health(cfg, state, problems, now):
         del state["_error"]
 
 
-def run_once(cfg):
-    """Одна проверка с отчётом о сбоях. Возвращает True, если всё прошло."""
+def load_state():
+    """(состояние, восстановилось ли оно). Нет файла или он битый — не восстановилось."""
     try:
-        state = load_json(STATE, {})
-    except ValueError:
-        state = {}
+        return json.loads(STATE.read_text(encoding="utf-8")), True
+    except (FileNotFoundError, ValueError):
+        return {}, False
+
+
+def run_once(cfg, now=None):
+    """Одна проверка с отчётом о сбоях и сводкой. Возвращает True, если всё прошло."""
+    now = time.time() if now is None else now
+    state, restored = load_state()
+    problems = []
+    # В GitHub состояние приезжает из кэша. Не приехало — не затираем историю пустым файлом:
+    # без state.json workflow не сохранит кэш, и следующий запуск возьмёт прежний.
+    persist = restored or os.environ.get("GITHUB_ACTIONS") != "true" \
+        or os.environ.get("RESET_STATE") == "true"
+    if not persist:
+        problems.append("состояние бота не восстановилось из кэша GitHub — история курсов в этот раз "
+                        "не сохраняется. Разовый сбой пройдёт сам; если повторяется больше часа — "
+                        "запустите workflow вручную с галочкой reset_state")
+    ctx = {}
     try:
-        problems = check(cfg, state)
+        problems += check(cfg, state, ctx)
     except Exception as e:
-        problems = [describe(e)]
+        problems.append(describe(e))
+    if persist and "obs" in ctx:
+        msk = datetime.fromtimestamp(now, MSK)
+        record(state, msk.date().isoformat(), ctx["obs"], now)
+        sm = summary_cfg(cfg)
+        force = os.environ.get("FORCE_SUMMARY") == "true"
+        if sm and (force or (state.get("_summary_day") != msk.date().isoformat()
+                             and msk.strftime("%H:%M") >= sm["at"])):
+            try:
+                tg_send(cfg, build_summary(state, ctx, msk.date(), sm["cbr_meetings"]))
+                state["_summary_day"] = msk.date().isoformat()
+                print("[summary] отправлена")
+            except Exception as e:
+                problems.append(f"сводка: {describe(e)}")
     token = str(cfg.get("telegram", {}).get("token") or "")
     if token:
         problems = [p.replace(token, "***") for p in problems]
     for p in problems:
         print("[error]", p)
-    report_health(cfg, state, problems, time.time())
-    STATE.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+    report_health(cfg, state, problems, now)
+    if persist:
+        STATE.write_text(json.dumps(state, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     print(time.strftime("%H:%M:%S"), "проверено" if not problems else "проверка с ошибками")
     return not problems
 
@@ -233,6 +457,16 @@ def main():
         return
     if cfg is None:
         raise SystemExit("Нет config.json — скопируйте config.example.json")
+    if args[:1] == ["--summary"]:
+        global tg_send
+        tg_send = lambda c, t: None  # только показать: уведомления о курсе не слать
+        state, _ = load_state()
+        ctx = {}
+        check(cfg, json.loads(json.dumps(state)), ctx)  # антиспам не трогаем: проверяем на копии
+        msk = datetime.now(MSK)
+        record(state, msk.date().isoformat(), ctx.get("obs", {}), time.time())
+        print(build_summary(state, ctx, msk.date(), summary_cfg(cfg)["cbr_meetings"]))
+        return
     if args[:1] == ["--once"]:
         # красный запуск в GitHub = запасной канал, если не дошло и предупреждение в Telegram
         sys.exit(0 if run_once(cfg) else 1)
