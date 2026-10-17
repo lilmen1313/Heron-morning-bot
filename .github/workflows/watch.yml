@@ -2,6 +2,15 @@ name: bestchange-watch
 
 on:
   workflow_dispatch:
+    inputs:
+      summary_now:
+        description: "Прислать сводку сейчас"
+        type: boolean
+        default: false
+      reset_state:
+        description: "Начать состояние заново (только если бот пишет, что состояние не восстановилось)"
+        type: boolean
+        default: false
 
 concurrency:
   group: watch
@@ -23,9 +32,12 @@ jobs:
       - run: python watcher.py --once
         env:
           WATCHER_CONFIG: ${{ secrets.WATCHER_CONFIG }}
+          FORCE_SUMMARY: ${{ inputs.summary_now }}
+          RESET_STATE: ${{ inputs.reset_state }}
 
+      # Без state.json не сохраняем: иначе пустой файл после сбоя кэша затрёт историю курсов
       - uses: actions/cache/save@v4
-        if: always()
+        if: always() && hashFiles('state.json') != ''
         with:
           path: state.json
           key: state-${{ github.run_id }}
