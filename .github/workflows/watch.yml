@@ -32,6 +32,7 @@ jobs:
       - run: python watcher.py --once
         env:
           WATCHER_CONFIG: ${{ secrets.WATCHER_CONFIG }}
+          RULES_URL: ${{ secrets.RULES_URL }}
           FORCE_SUMMARY: ${{ inputs.summary_now }}
           RESET_STATE: ${{ inputs.reset_state }}
 
